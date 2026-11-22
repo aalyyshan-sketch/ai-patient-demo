@@ -24,12 +24,12 @@ async function freeModels() {
   return modelCache.list;
 }
 
-async function ask(messages, { json = false } = {}) {
+async function ask(messages, { json = false, skip = 0, deadline = Date.now() + 34000 } = {}) {
   if (MOCK) return mockReply(messages, json);
   if (!KEY) throw new Error('The AI key is not set yet (OPENROUTER_API_KEY).');
-  const models = await freeModels();
+  const all = await freeModels();
+  const models = [...all.slice(skip % all.length), ...all.slice(0, skip % all.length)];
   let lastErr = 'No free AI model is available right now.';
-  const deadline = Date.now() + 34000; // the edge function must answer within ~40s
   for (const model of models) { // if a free model is busy, try the next one
     const left = deadline - Date.now();
     if (left < 4000) break;
@@ -44,9 +44,11 @@ async function ask(messages, { json = false } = {}) {
       const text = String(j.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^[\s\S]*<\/think>/i, '').trim();
       if (r.ok && text) return text;
       lastErr = j.error?.message || `Model busy (${r.status})`;
+      // Account-wide free plan limit: other models would fail too, and failed tries still count, so stop here.
+      if (r.status === 429 && /free-models-per|per-day|per-min/i.test(lastErr)) break;
     } catch (e) { lastErr = e.message; }
   }
-  throw new Error(lastErr);
+  throw new Error(/rate limit|429/i.test(lastErr) ? 'The free AI is busy right now. Please wait a few seconds and try again.' : lastErr);
 }
 
 function patientPrompt() {
@@ -73,14 +75,38 @@ function feedbackPrompt(transcript) {
 SCORING GUIDE
 ${guide}
 
-Answer ONLY with JSON in this shape:
-{"items":[{"item":"...","points_possible":1,"points_awarded":1,"evidence":"short quote or 'Not asked'"}],"strengths":["..."],"improve":["..."],"summary":"2 sentences of encouraging, honest feedback"}` },
+Write your answer in EXACTLY this plain-text format, nothing else:
+SCORES
+<item number>|<points awarded>|<short evidence: the student's words, or Not asked>
+(one line for every item, 1 to ${caseData.scoring_guide.length}, in order)
+STRENGTHS
+- <one strength>
+- <another strength>
+IMPROVE
+- <one thing to improve>
+- <another thing to improve>
+SUMMARY
+<2 sentences of encouraging, honest feedback>` },
   { role: 'user', content: `TRANSCRIPT\n${transcript}` }];
 }
 
-function parseJson(text) {
-  const m = String(text).match(/\{[\s\S]*\}/);
-  return JSON.parse(m ? m[0] : text);
+function parseFeedback(text) {
+  text = String(text);
+  try { const m = text.match(/\{[\s\S]*\}/); const j = JSON.parse(m ? m[0] : text);
+    if (Array.isArray(j.items) && j.items.length) return j; } catch {}
+  const items = [], strengths = [], improve = []; let summary = '', sec = '';
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\*\*/g, '').trim(); if (!line) continue;
+    const head = line.replace(/[:#]/g, '').trim().toUpperCase();
+    if (['SCORES', 'STRENGTHS', 'IMPROVE', 'SUMMARY'].includes(head)) { sec = head; continue; }
+    const m = line.match(/^(\d+)\s*[|.):-]\s*(\d+(?:\.\d+)?)\s*(?:\/\s*\d+)?\s*\|?\s*(.*)$/);
+    if (m && (sec === 'SCORES' || sec === '')) { items[+m[1] - 1] = { points_awarded: +m[2], evidence: m[3].replace(/^["']|["']$/g, '') || 'Not asked' }; continue; }
+    const bullet = line.replace(/^[-*•]\s*/, '');
+    if (sec === 'STRENGTHS') strengths.push(bullet); else if (sec === 'IMPROVE') improve.push(bullet); else if (sec === 'SUMMARY') summary += (summary ? ' ' : '') + line;
+  }
+  const found = items.filter(Boolean).length;
+  if (found < Math.ceil(caseData.scoring_guide.length / 2)) throw new Error('The AI scoring came back incomplete.');
+  return { byNumber: true, items, strengths: strengths.slice(0, 4), improve: improve.slice(0, 4), summary };
 }
 
 export const config = { path: '/api/chat' };
@@ -97,17 +123,25 @@ export default async (req) => {
     if (mode === 'patient') {
       const reply = await ask([{ role: 'system', content: patientPrompt() },
         { role: 'assistant', content: caseData.patient.opening_line }, ...turns]);
-      return Response.json({ reply: reply.replace(/^\s*\*?\*?[A-Z][a-z]+( [A-Z][a-z]+)?:\*?\*?\s*/, '') });
+      const first = caseData.patient.name.split(' ')[0];
+      const label = new RegExp(`^\\s*\\**\\s*(${first}|${caseData.patient.name}|Patient)\\s*\\**\\s*:\\s*\\**\\s*`, 'i');
+      return Response.json({ reply: reply.replace(label, '') });
     }
     if (mode === 'feedback') {
       const transcript = [`Patient: ${caseData.patient.opening_line}`, ...turns.map(t => `${t.role === 'user' ? 'Student' : 'Patient'}: ${t.content}`)].join('\n');
       let result;
-      for (let i = 0; i < 2 && !result; i++) { try { result = parseJson(await ask(feedbackPrompt(transcript), { json: true })); } catch (e) { if (i) throw e; } }
-      // Always grade against the guide itself: match each guide line to the AI's answer by wording, then by position.
+      let lastErr;
+      const deadline = Date.now() + 36000; // one time budget for all tries (Netlify allows ~40s)
+      for (let i = 0; i < 3 && !result && deadline - Date.now() > 8000; i++) {
+        try { result = parseFeedback(await ask(feedbackPrompt(transcript), { json: true, skip: i, deadline })); }
+        catch (e) { lastErr = e; if (/busy|key/i.test(e.message)) break; }
+      }
+      if (!result) throw new Error(lastErr && /busy|key/i.test(lastErr.message) ? lastErr.message : 'Scoring did not finish this time. Please click End visit again.');
+      // Always grade against the guide itself, so points can never exceed what each item is worth.
       const got = Array.isArray(result.items) ? result.items : [];
       const norm = s => String(s || '').toLowerCase().replace(/[^a-z ]/g, '').slice(0, 28);
       const items = caseData.scoring_guide.map((g, i) => {
-        const it = got.find(x => norm(x.item) === norm(g.item)) || (got[i] && norm(got[i].item).slice(0, 12) === norm(g.item).slice(0, 12) ? got[i] : null) || got[i] || {};
+        const it = result.byNumber ? (got[i] || {}) : (got.find(x => norm(x.item) === norm(g.item)) || got[i] || {});
         return { item: g.item, possible: g.points, awarded: Math.max(0, Math.min(g.points, Math.round(+it.points_awarded || 0))), evidence: it.evidence || 'Not assessed' };
       });
       const total = items.reduce((a, b) => a + b.awarded, 0), max = caseData.scoring_guide.reduce((a, b) => a + b.points, 0);
@@ -121,8 +155,8 @@ export default async (req) => {
 
 // Local testing only (MOCK_AI=1): canned answers so the page can be tested without AI access.
 function mockReply(messages, json) {
-  if (json) return JSON.stringify({ items: caseData.scoring_guide.map((g, i) => ({ item: g.item, points_possible: g.points, points_awarded: i % 3 ? g.points : 0, evidence: i % 3 ? '"Tell me what brings you in today"' : 'Not asked' })),
-    strengths: ['Warm, open start'], improve: ['Ask about family history'], summary: 'Solid start. Cover family and social history next time.' });
+  if (json) return 'Here is the grading.\n**SCORES**\n' + caseData.scoring_guide.map((g, i) => `${i + 1}|${i % 3 ? g.points : 0}|${i % 3 ? '"Tell me what brings you in today"' : 'Not asked'}`).join('\n') +
+    '\nSTRENGTHS:\n- Warm, open start\nIMPROVE:\n- Ask about family history\nSUMMARY:\nSolid start. Cover family and social history next time.';
   const last = messages[messages.length - 1]?.content || '';
   return /thirst|water|drink/i.test(last) ? 'Yeah, I drink maybe ten or twelve glasses a day and I\'m still thirsty.' : 'It started maybe two months ago, and it\'s been slowly getting worse.';
 }
