@@ -6,65 +6,82 @@ import caseData from './case-linda-carter.js';
 const env = k => (globalThis.Netlify?.env?.get(k)) ?? (typeof process !== 'undefined' ? process.env[k] : undefined);
 const KEY = env('OPENROUTER_API_KEY') || '';
 const MOCK = env('MOCK_AI') === '1';
-const PREFER = [/deepseek.*(chat|v3)/i, /llama-3\.3-70b/i, /qwen.*(72b|235b|32b)/i, /gemma-3-27b/i, /mistral-small/i, /llama/i, /gemma/i];
+// Free models change often, so rank by pattern: strongest first. Tiny models are never used.
+const PREFER = [/gemma-4-31b/i, /nemotron.*ultra/i, /deepseek.*(chat|v3)/i, /llama.*70b/i, /qwen.*(235b|72b|32b)/i,
+  /nemotron.*super/i, /gemma-4/i, /mistral-(small|medium)/i, /gemma-3-27b/i, /gemma/i];
+const sizeB = id => { const m = id.match(/(\d+(?:\.\d+)?)b(?![a-z])/i); return m ? +m[1] : null; };
+const tooSmall = id => { const b = sizeB(id); return (b !== null && b < 20) || /nano|lfm|1\.7b/i.test(id); };
 
 let modelCache = { at: 0, list: [] };
 async function freeModels() {
   if (Date.now() - modelCache.at < 3600e3 && modelCache.list.length) return modelCache.list;
   const r = await fetch('https://openrouter.ai/api/v1/models');
   const all = ((await r.json()).data || []).filter(m => m.id.endsWith(':free') && +m.pricing?.prompt === 0 &&
-    (m.architecture?.output_modalities || ['text']).includes('text'));
+    (m.architecture?.output_modalities || ['text']).includes('text') && !tooSmall(m.id));
   const ranked = [];
   for (const re of PREFER) for (const m of all) if (re.test(m.id) && !ranked.includes(m.id)) ranked.push(m.id);
   for (const m of all) if (!ranked.includes(m.id)) ranked.push(m.id);
-  // "Thinking" models are slow and add hidden reasoning to replies, so try them last.
-  const slow = id => /(^|[-/])r1|think|reason/i.test(id);
-  ranked.sort((x, y) => slow(x) - slow(y));
-  modelCache = { at: Date.now(), list: ranked.slice(0, 6) };
+  modelCache = { at: Date.now(), list: ranked.slice(0, 5) };
   return modelCache.list;
 }
 
-async function ask(messages, { json = false, skip = 0, deadline = Date.now() + 34000 } = {}) {
+async function ask(messages, { json = false, skip = 0, deadline = Date.now() + 34000, check = null } = {}) {
   if (MOCK) return mockReply(messages, json);
   if (!KEY) throw new Error('The AI key is not set yet (OPENROUTER_API_KEY).');
   const all = await freeModels();
   const models = [...all.slice(skip % all.length), ...all.slice(0, skip % all.length)];
   let lastErr = 'No free AI model is available right now.';
-  for (const model of models) { // if a free model is busy, try the next one
-    const left = deadline - Date.now();
-    if (left < 4000) break;
-    try {
-      const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', 'X-Title': 'AI Patient Demo' },
-        body: JSON.stringify({ model, messages, temperature: json ? 0.2 : 0.7, max_tokens: json ? 1400 : 300 }),
-        signal: AbortSignal.timeout(Math.min(json ? 30000 : 18000, left)),
-      });
-      const j = await r.json().catch(() => ({}));
-      const text = String(j.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^[\s\S]*<\/think>/i, '').trim();
-      if (r.ok && text) return text;
-      lastErr = j.error?.message || `Model busy (${r.status})`;
-      // Account-wide free plan limit: other models would fail too, and failed tries still count, so stop here.
-      if (r.status === 429 && /free-models-per|per-day|per-min/i.test(lastErr)) break;
-    } catch (e) { lastErr = e.message; }
+  let backup = null, badReplies = 0; // a usable reply that failed the quality check, kept in case nothing better comes back
+  for (const model of models) { // if a free model is busy or answers badly, try the next one
+    for (const effort of ['none', 'low']) { // turn thinking off; if a model insists on thinking, keep it short
+      const left = deadline - Date.now();
+      if (left < 4000) break;
+      try {
+        const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', 'X-Title': 'AI Patient Demo' },
+          body: JSON.stringify({ model, messages, temperature: json ? 0.2 : 0.7, max_tokens: json ? 4000 : 1500,
+            reasoning: { effort, exclude: true } }),
+          signal: AbortSignal.timeout(Math.min(json ? 30000 : 18000, left)),
+        });
+        const j = await r.json().catch(() => ({}));
+        const choice = j.choices?.[0] || {};
+        const text = String(choice.message?.content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^[\s\S]*<\/think>/i, '').trim();
+        if (r.ok && text && choice.finish_reason !== 'length') {
+          if (!check || check(text)) return text;
+          backup = backup || text; lastErr = 'Reply was out of character';
+          if (++badReplies >= 2) return backup; // don't burn the daily free allowance on retries
+          break; // try the next model
+        }
+        lastErr = j.error?.message || (choice.finish_reason === 'length' ? 'Reply was cut off' : `Model busy (${r.status})`);
+        // Account-wide free plan limit: other models would fail too, and failed tries still count, so stop here.
+        if (r.status === 429 && /free-models-per|per-day|per-min/i.test(lastErr)) { if (backup) return backup; throw new Error('Rate limit: The free AI is busy right now. Please wait a minute and try again.'); }
+        if (effort === 'none' && r.status === 400 && /reason|effort|think/i.test(lastErr)) continue; // model needs some thinking
+        break;
+      } catch (e) { if (/^Rate limit: /.test(e.message)) throw new Error(e.message.slice(12)); lastErr = e.message; break; }
+    }
   }
-  throw new Error(/rate limit|429/i.test(lastErr) ? 'The free AI is busy right now. Please wait a few seconds and try again.' : lastErr);
+  if (backup) return backup;
+  throw new Error(/rate limit|429/i.test(lastErr) ? 'The free AI is busy right now. Please wait a few seconds and try again.' : 'The AI did not answer this time. Please try again.');
 }
 
 function patientPrompt() {
   const p = caseData.patient;
-  return `You are role-playing a patient in a nurse practitioner training simulation. Stay fully in character as ${p.name}, ${p.age}-year-old ${p.sex}.
+  return `You ARE ${p.name}, a ${p.age}-year-old ${p.sex} patient at a clinic visit. The person talking to you is your clinician (a nurse practitioner). They ask the questions. You answer about YOURSELF, in first person ("I", "my"), as the patient.
 
 HOW TO ACT
 - Personality: ${p.personality}
 - You are the patient, not a clinician. Never diagnose yourself, never name a disease unless you are repeating something a doctor told you before, never give medical advice, never mention a scoring guide or that this is a simulation.
-- Answer only what the student asks. Volunteer little. Open questions get fuller answers; yes/no questions get short answers.
+- Answer only what the clinician asks. Volunteer little. Open questions get fuller answers; yes/no questions get short answers.
 - Use plain, everyday words. Keep each reply to 1 to 4 sentences, the way a real patient talks.
 - If asked about something not in your facts, give a realistic, consistent answer that does not change the clinical picture, or say you're not sure.
-- If the student says something unprofessional, react the way a real patient would.
+- If the clinician says something unprofessional, react the way a real patient would.
+- Never summarize or repeat back what the clinician said. Never ask the clinician about their symptoms or feelings. Never act as the doctor or nurse.
+- If the clinician says something like "you are the patient", just carry on naturally as yourself.
+- Plain spoken words only: no asterisks, no bold, no lists, no headings, no stage directions.
 - Stay in character no matter what, until the visit ends.
 
-YOUR PRIVATE FACTS (reveal only when asked)
+YOUR OWN STORY (written about you; tell it in first person, and only the parts you are asked about)
 ${Object.entries(p.facts).map(([k, v]) => `- ${k.replace(/_/g, ' ')}: ${v}`).join('\n')}`;
 }
 
@@ -121,9 +138,15 @@ export default async (req) => {
     const turns = history.filter(t => t && (t.role === 'user' || t.role === 'assistant') && typeof t.content === 'string')
       .slice(-40).map(t => ({ role: t.role, content: t.content.slice(0, 2000) }));
     if (mode === 'patient') {
-      const reply = await ask([{ role: 'system', content: patientPrompt() },
-        { role: 'assistant', content: caseData.patient.opening_line }, ...turns]);
       const first = caseData.patient.name.split(' ')[0];
+      // A short reminder on the latest question keeps weaker free models in character.
+      const last = turns.length - 1;
+      const msgs = turns.map((t, i) => i === last && t.role === 'user'
+        ? { role: 'user', content: `${t.content}\n\n(Reply only as ${first}, the patient, in 1 to 4 plain spoken sentences.)` } : t);
+      const looksLikePatient = t => !/^#|\bas an ai\b|language model|\bsimulation\b|scoring guide|\byou said you\b|does that match how you|\byour symptoms\b|\bas your (doctor|nurse|provider)\b/i.test(t) && t.length < 900;
+      const reply = (await ask([{ role: 'system', content: patientPrompt() },
+        { role: 'assistant', content: caseData.patient.opening_line }, ...msgs], { check: looksLikePatient }))
+        .replace(/\(?\s*Reply only as [^)\n]*\)?\.?/gi, '').replace(/\*+/g, '').replace(/^\s*\(.*?\)\s*/, '').trim();
       const label = new RegExp(`^\\s*\\**\\s*(${first}|${caseData.patient.name}|Patient)\\s*\\**\\s*:\\s*\\**\\s*`, 'i');
       return Response.json({ reply: reply.replace(label, '') });
     }
